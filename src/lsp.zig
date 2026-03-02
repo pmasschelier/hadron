@@ -1,7 +1,7 @@
 const std = @import("std");
 const Rpc = @import("lsp/Rpc.zig");
-const Message = @import("lsp/Message.zig");
 const Lsp = @import("lsp/Lsp.zig");
+const State = @import("lsp/State.zig");
 
 pub fn main() !void {
     // Setting up stdin, stdout and logger interfaces
@@ -23,23 +23,29 @@ pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
+    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    defer std.debug.assert(gpa.deinit() == .ok);
+
+    var state = State.init(gpa.allocator());
+    defer state.deinit();
+
     // Read from stdin until an error is returned
     while (Rpc.read(reader, arena.allocator())) |msg| {
         try logger.print("Received a message of {} bytes:\n{s}\n", .{ msg.header.contentLength, msg.body.content });
-        const message = try Message.parse(msg.body.content, arena.allocator());
+        const message = try Lsp.parse(msg.body.content, arena.allocator());
         try logger.print("Decoded message: {}\n", .{message});
         switch (message.method) {
             .initialize => {
-                const result = Message.InitializeResult{
+                const result = Lsp.InitializeResult{
                     .capabilities = .{
-                        .textDocumentSync = @intFromEnum(Message.TextDocumentSyncKind.Full),
+                        .textDocumentSync = @intFromEnum(Lsp.TextDocumentSyncKindEnum.Full),
                     },
                     .serverInfo = .{
                         .name = "educational-lsp",
                         .version = "0.0.0.0-beta1",
                     },
                 };
-                const response = message.respond(Message.InitializeResult, result);
+                const response = message.respond(Lsp.InitializeResult, result);
                 const content = try std.json.Stringify.valueAlloc(arena.allocator(), response, .{
                     .emit_null_optional_fields = false,
                 });
@@ -47,11 +53,16 @@ pub fn main() !void {
             },
             .initialized => {},
             .@"textDocument/didOpen" => |params| {
+                try state.open(params.textDocument);
                 try logger.print("Received text content: {s}\n", .{params.textDocument.text});
+            },
+            .@"textDocument/didChange" => |params| {
+                try state.change(params);
+                try logger.print("Text changed: {s} (v{})\n", .{ params.textDocument.uri, params.textDocument.version });
             },
         }
         try logger.flush();
-        _ = arena.reset(.retain_capacity);
+        _ = arena.reset(.{ .retain_with_limit = std.heap.pageSize() });
     } else |err| switch (err) {
         error.EndOfStream => try logger.print("End of stream reached, closing...\n", .{}),
         else => return err,
